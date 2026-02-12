@@ -1,4 +1,5 @@
 {
+  "description": "On-demand OpenAI Codex CLI connector supporting API key/OAuth auth modes and configurable execution context for code-oriented prompting.",
   "domainCategory": "AI & Automation",
   "subjectiveTechnologyElement": "DataSources",
   "publisher": "BrainBoost Ltd.",
@@ -9,7 +10,7 @@
     {
       "type": "splitList",
       "title": "Codex",
-      "text": "OnDemand data source for OpenAI Codex CLI interactions.",
+      "text": "On-demand OpenAI Codex CLI connector supporting API key/OAuth auth modes and configurable execution context for code-oriented prompting.",
       "image": {
         "src": "/subjective_codex_datasource/icon.svg",
         "alt": "Codex icon"
