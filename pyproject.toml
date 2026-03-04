@@ -1,0 +1,13 @@
+﻿[project]
+name = "subjective_codex_datasource"
+version = "0.1.0"
+description = "Subjective data source plugin: Codex."
+requires-python = ">=3.12"
+dependencies = [
+  "brainboost-rclone-oauth-package @ git+https://github.com/Subjective-Technologies/brainboost_rclone_oauth_package.git",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
