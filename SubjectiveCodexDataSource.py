@@ -1,10 +1,16 @@
-import os
-import subprocess
+import base64
+import binascii
 import json
+import mimetypes
+import os
 import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
-from subjective_abstract_data_source_package import SubjectiveOnDemandDataSource
+
 from brainboost_data_source_logger_package.BBLogger import BBLogger
+from subjective_abstract_data_source_package import SubjectiveOnDemandDataSource
 
 
 class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
@@ -14,6 +20,8 @@ class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
     Supports both API key and OAuth authentication methods.
     Uses 'codex exec' for stateless message processing.
     """
+
+    MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 
     def __init__(self, name=None, session=None, dependency_data_sources=None,
                  subscribers=None, params=None):
@@ -132,7 +140,12 @@ class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
             BBLogger.log(f"Error during Codex OAuth login: {e}")
             return False
 
-    def _build_command(self, message: str) -> list:
+    def _build_command(
+        self,
+        message: str,
+        image_paths: Optional[list] = None,
+        extra_dirs: Optional[list] = None,
+    ) -> list:
         """Build the codex exec command with all options."""
         codex_path = self._find_codex_cli()
         if not codex_path:
@@ -163,10 +176,91 @@ class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
         if self.working_directory:
             cmd.extend(["--cd", self.working_directory])
 
+        # The attachment dir is outside the workspace. Codex will not read a PDF
+        # staged there unless the directory is granted.
+        for directory in extra_dirs or []:
+            cmd.extend(["--add-dir", directory])
+
+        # codex exec --image attaches image files. It is not a general file flag.
+        for path in image_paths or []:
+            cmd.extend(["--image", path])
+
         # Add the prompt
         cmd.append(message)
 
         return cmd
+
+    def _render_attachments(self, prompt: str, files: list, temp_dir: str) -> tuple:
+        """Turn dashboard files into a prompt plus `--image` paths.
+
+        `text/*` is inlined. `image/*` is written and passed to `--image`.
+        Anything else, including `application/pdf`, is written and named in the
+        prompt so the agent can read it. `codex exec` has no non-image file flag.
+        """
+        image_paths: list[str] = []
+        extra_dirs: list[str] = []
+        for index, item in enumerate(files or []):
+            if not isinstance(item, dict):
+                continue
+            name = Path(str(item.get("filename") or item.get("name") or f"file-{index}")).name or f"file-{index}"
+            mime_type = str(
+                item.get("mime_type")
+                or item.get("type")
+                or mimetypes.guess_type(name)[0]
+                or "application/octet-stream"
+            )
+            if item.get("content") is None and item.get("data_base64") is None and isinstance(item.get("text"), str):
+                prompt = self._append_text_attachment(prompt, name, item["text"])
+                continue
+            raw = self._decode_attachment(item)
+            if raw is None:
+                continue
+            if len(raw) > self.MAX_ATTACHMENT_BYTES:
+                prompt = self._append_text_attachment(
+                    prompt,
+                    name,
+                    f"[Attachment omitted: exceeds {self.MAX_ATTACHMENT_BYTES} bytes]",
+                )
+                continue
+            if mime_type.startswith("text/"):
+                prompt = self._append_text_attachment(prompt, name, raw.decode("utf-8", errors="replace"))
+                continue
+            path = os.path.join(temp_dir, f"{index}-{name}")
+            with open(path, "wb") as handle:
+                handle.write(raw)
+            if mime_type.startswith("image/"):
+                image_paths.append(path)
+            else:
+                prompt = self._append_file_path(prompt, path)
+            if temp_dir not in extra_dirs:
+                extra_dirs.append(temp_dir)
+        return prompt, image_paths, extra_dirs
+
+    @staticmethod
+    def _decode_attachment(item: dict) -> Optional[bytes]:
+        raw_value = item.get("data_base64")
+        if raw_value is None:
+            raw_value = item.get("content")
+        if raw_value is None:
+            return None
+        try:
+            return base64.b64decode(str(raw_value), validate=True)
+        except (binascii.Error, ValueError):
+            return str(raw_value).encode("utf-8", errors="replace")
+
+    @staticmethod
+    def _append_text_attachment(prompt: str, name: str, text: str) -> str:
+        block = f"<attachment name={json.dumps(name)}>\n{text}\n</attachment>"
+        return f"{prompt}\n\n{block}" if prompt else block
+
+    @staticmethod
+    def _append_file_path(prompt: str, path: str) -> str:
+        block = (
+            f"<attachment_path path={json.dumps(path)}>\n"
+            "Read this attached file from the local filesystem.\n"
+            "</attachment_path>"
+        )
+        return f"{prompt}\n\n{block}" if prompt else block
 
     def _parse_json_output(self, output: str) -> dict:
         """Parse the newline-delimited JSON output from codex exec."""
@@ -207,8 +301,12 @@ class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
         Returns:
             Dictionary with response data
         """
-        # Ensure we have string message
+        # Ensure we have string message. files ride on the same dict.
+        files: list = []
         if isinstance(message, dict):
+            raw_files = message.get("files")
+            if isinstance(raw_files, list):
+                files = raw_files
             message = message.get("content", str(message))
         message = str(message)
 
@@ -222,8 +320,23 @@ class SubjectiveCodexDataSource(SubjectiveOnDemandDataSource):
             }
 
         try:
-            # Build and execute command
-            cmd = self._build_command(message)
+            # Build and execute command. The temp dir has to outlive the CLI call:
+            # --image and the PDF path are read from disk while codex runs.
+            with tempfile.TemporaryDirectory(prefix="subjective-codex-") as temp_dir:
+                prompt, image_paths, extra_dirs = self._render_attachments(message, files, temp_dir)
+                cmd = self._build_command(prompt, image_paths=image_paths, extra_dirs=extra_dirs)
+                return self._run_codex(cmd, message)
+        except Exception as e:
+            BBLogger.log(f"Error executing Codex command: {e}")
+            return {
+                "error": True,
+                "error_type": "exception",
+                "message": str(e),
+                "original_message": message
+            }
+
+    def _run_codex(self, cmd: list, message: str) -> dict:
+        try:
             BBLogger.log(f"Executing Codex command: {' '.join(cmd[:3])}...")
 
             # Set up environment
